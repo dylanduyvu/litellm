@@ -2149,3 +2149,49 @@ async def test_caller_cannot_spoof_a_priority_group_to_bypass_fallback_gates(
             **{metadata_bucket: {"pre_routing_selected_model": "priority-group"}},
         )
     assert checked == ["priority-group"]
+
+
+def _sync_task_count() -> int:
+    return sum(
+        1
+        for t in asyncio.all_tasks()
+        if t.get_coro() is not None
+        and t.get_coro().__qualname__ == "BaseRoutingStrategy.periodic_sync_in_memory_spend_with_redis"
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_settings_same_routing_strategy_args_does_not_leak_sync_tasks(monkeypatch) -> None:
+    monkeypatch.setattr(litellm, "callbacks", [])
+    monkeypatch.setattr(litellm, "input_callback", [])
+    router: Final = Router(
+        model_list=_model_list(),
+        routing_strategy="usage-based-routing-v2",
+        routing_strategy_args={"ttl": 60},
+    )
+    try:
+        assert _sync_task_count() == 1
+        selector_before: Final = router.lowesttpm_logger_v2
+
+        for _ in range(5):
+            router.update_settings(routing_strategy_args={"ttl": 60})
+        await asyncio.sleep(0)
+        assert _sync_task_count() == 1
+        assert router.lowesttpm_logger_v2 is selector_before, "same routing_strategy_args must not rebuild the selector"
+
+        router.update_settings(routing_strategy_args={"ttl": 120})
+        await asyncio.sleep(0)
+        assert _sync_task_count() == 1
+        assert router.lowesttpm_logger_v2.routing_args.ttl == 120
+    finally:
+        for t in [
+            t
+            for t in asyncio.all_tasks()
+            if t.get_coro() is not None
+            and t.get_coro().__qualname__ == "BaseRoutingStrategy.periodic_sync_in_memory_spend_with_redis"
+        ]:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
